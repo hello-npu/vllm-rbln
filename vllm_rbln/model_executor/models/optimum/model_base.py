@@ -222,6 +222,7 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
         input_block_ids: torch.Tensor | None = None,
         padded_batch_size: int | None = None,
         dummy_block: int | None = None,
+        prefill_pad_target: tuple[int, int] | None = None,
     ):
         assert input_ids.shape[1] == 1
         if input_block_ids is None and padded_batch_size is None:
@@ -262,13 +263,28 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
             mask[input_block_ids, :] = False
 
         if torch.any(mask):
+            pad_position = 0
             if dummy_block is not None:
                 padding_blocks = torch.tensor([dummy_block], dtype=block_tables.dtype)
             else:
                 padding_blocks = self.available_blocks[
                     ~torch.isin(self.available_blocks, block_tables.flatten())
                 ]
+                if prefill_pad_target is not None:
+                    # A chunked prefill is in progress in a block that is not
+                    # part of this decode batch: never write its position 0.
+                    pf_block, pf_pos = prefill_pad_target
+                    padding_blocks = padding_blocks[padding_blocks != pf_block]
+                    if padding_blocks.numel() == 0:
+                        # Every block is owned. Write the padding row's KV at
+                        # the position the next prefill chunk overwrites.
+                        padding_blocks = torch.tensor(
+                            [pf_block], dtype=block_tables.dtype
+                        )
+                        pad_position = pf_pos
             padded_block_tables[mask] = padding_blocks[0]
+            if pad_position:
+                padded_position_ids[mask.all(dim=1)] = pad_position
         return padded_input_ids, padded_position_ids, padded_block_tables
 
     def preprocess_for_decoder(
@@ -279,6 +295,7 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
         cache_position: torch.Tensor | None = None,
         input_block_ids: list[int] | None = None,
         dummy_block: int | None = None,
+        prefill_pad_target: tuple[int, int] | None = None,
     ):
         padded_batch_size = None
         # 1. Set the type
@@ -311,6 +328,7 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
                 input_block_ids=input_block_ids,
                 padded_batch_size=padded_batch_size,
                 dummy_block=dummy_block,
+                prefill_pad_target=prefill_pad_target,
             )
         kwargs = {
             "block_tables": block_tables,

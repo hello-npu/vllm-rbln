@@ -46,6 +46,9 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     VLLM_RBLN_AUTO_PORT: bool = True
+    VLLM_RBLN_INTERLEAVE_POLICY: str = "none"
+    VLLM_RBLN_INTERLEAVE_K: int = 1
+    VLLM_RBLN_INTERLEAVE_SLACK_MS: float = 30.0
 
 
 def get_dp_impl() -> str:
@@ -225,6 +228,17 @@ environment_variables = {
     # Enable NUMA-based CPU affinity binding for OpenMP threads
     "VLLM_RBLN_NUMA": (
         lambda: os.environ.get("VLLM_RBLN_NUMA", "True").lower() in ("true", "1")
+    ),
+    # Interleave prefill chunks with decode steps (optimum path only).
+    # none (default, current behaviour) | fixed | slack
+    "VLLM_RBLN_INTERLEAVE_POLICY": (
+        lambda: os.environ.get("VLLM_RBLN_INTERLEAVE_POLICY", "none").lower()
+    ),
+    # fixed policy: number of prefill chunks between two decode steps
+    "VLLM_RBLN_INTERLEAVE_K": lambda: int(os.environ.get("VLLM_RBLN_INTERLEAVE_K", 1)),
+    # slack policy: target max inter-token gap of running requests (ms)
+    "VLLM_RBLN_INTERLEAVE_SLACK_MS": lambda: float(
+        os.environ.get("VLLM_RBLN_INTERLEAVE_SLACK_MS", 30.0)
     ),
     "VLLM_RBLN_SORT_BATCH": (
         lambda: os.environ.get("VLLM_RBLN_SORT_BATCH", "False").lower() in ("true", "1")

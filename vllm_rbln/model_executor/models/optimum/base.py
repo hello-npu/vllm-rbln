@@ -35,6 +35,9 @@ class ModelInputForRBLN:
     cached_lengths: list[int] = field(default_factory=list)  # for prefix caching
     multi_modal_kwargs: BatchedTensorInputs | None = None
     dummy_block: int | None = None  # for prefix caching
+    # (block, position) of an in-progress chunked prefill; decode padding rows
+    # must not touch that block except at this position.
+    prefill_pad_target: tuple[int, int] | None = None
 
 
 version_error = RuntimeError(

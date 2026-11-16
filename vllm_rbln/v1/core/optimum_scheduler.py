@@ -36,7 +36,14 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
+import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.core.interleave_policy import (
+    CHUNK,
+    DECODE,
+    IDLE,
+    InterleavePolicy,
+)
 from vllm_rbln.v1.core.optimum_kv_cache_manager import RBLNKVCacheManager
 
 logger = init_logger(__name__)
@@ -62,6 +69,11 @@ class RBLNSchedulerOutput(SchedulerOutput):
     cached_block_table: list[int] = field(default_factory=list)
     cached_length: list[int] = field(default_factory=list)
     dummy_block: int | None = None
+    # (outer block id, position) of the request whose prefill is in progress.
+    # Only set on decode steps of the interleaved scheduler. Decode padding rows
+    # must not write position 0 of that block; if no free block is left they
+    # write this position, which the next prefill chunk overwrites.
+    prefill_pad_target: tuple[int, int] | None = None
 
 
 class RBLNOptimumScheduler(Scheduler):
@@ -193,7 +205,43 @@ class RBLNOptimumScheduler(Scheduler):
         self.use_pp = False
         self.use_v2_model_runner = False
 
+        # Prefill-chunk / decode interleaving (off by default).
+        self.interleave = InterleavePolicy(
+            mode=envs.VLLM_RBLN_INTERLEAVE_POLICY,
+            k=envs.VLLM_RBLN_INTERLEAVE_K,
+            slack_ms=envs.VLLM_RBLN_INTERLEAVE_SLACK_MS,
+        )
+        # The request whose prompt is being prefilled chunk by chunk.
+        self.prefilling: Request | None = None
+        self.prefill_chunk_size: int | None = None
+        if self.interleave.enabled:
+            self.prefill_chunk_size = self._get_prefill_chunk_size()
+            logger.info(
+                "Prefill/decode interleaving enabled: policy=%s k=%d "
+                "slack_ms=%.1f prefill_chunk_size=%d",
+                self.interleave.mode,
+                self.interleave.k,
+                self.interleave.slack_s * 1000.0,
+                self.prefill_chunk_size,
+            )
+
+    def _get_prefill_chunk_size(self) -> int:
+        additional = self.vllm_config.additional_config or {}
+        if "prefill_chunk_size" in additional:
+            return int(additional["prefill_chunk_size"])
+        from vllm_rbln.utils.optimum.configuration import get_rbln_config
+
+        rbln_config = get_rbln_config(self.vllm_config)
+        if rbln_config is None or "prefill_chunk_size" not in rbln_config:
+            raise ValueError(
+                "VLLM_RBLN_INTERLEAVE_POLICY requires prefill_chunk_size "
+                "in rbln_config.json"
+            )
+        return int(rbln_config["prefill_chunk_size"])
+
     def schedule(self) -> RBLNSchedulerOutput:
+        if self.interleave.enabled:
+            return self._schedule_interleaved()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -521,6 +569,298 @@ class RBLNOptimumScheduler(Scheduler):
             self._update_after_schedule(scheduler_output)
         # self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    # ------------------------------------------------------------------
+    # Prefill-chunk / decode interleaving
+    # ------------------------------------------------------------------
+    def _prefill_whole(self, request: Request) -> bool:
+        """Requests that keep the current one-shot prefill."""
+        return (
+            request.status == RequestStatus.PREEMPTED
+            or request.pooling_params is not None
+            or (
+                request.sampling_params is not None
+                and request.sampling_params.prompt_logprobs is not None
+            )
+            or bool(request.mm_features)
+        )
+
+    def _prefill_pad_target(self, request: Request) -> tuple[int, int]:
+        """(outer block id, position) of the next prefill chunk of `request`."""
+        pos = request.num_computed_tokens
+        if self.cache_config.enable_prefix_caching:
+            ob_size = self.vllm_config.additional_config["attn_block_size"]
+            table = self.kv_cache_manager.get_block_table(request.request_id)
+            return int(table.flatten()[pos // ob_size]), pos
+        block_ids = self.kv_cache_manager.get_block_ids(request.request_id)[0]
+        # vLLM block 0 is the null block; the compiled model counts from 0.
+        return int(block_ids[pos // self.block_size]) - 1, pos
+
+    def _schedule_interleaved(self) -> RBLNSchedulerOutput:
+        """One step = one prefill chunk of a single request OR one decode step
+        of every request that finished its prefill. Which one is decided by
+        `self.interleave` (fixed k or slack)."""
+        scheduled_new_reqs: list[Request] = []
+        scheduled_resumed_reqs: list[Request] = []
+        scheduled_running_reqs: list[Request] = []
+        preempted_reqs: list[Request] = []
+        req_to_new_blocks: dict[str, KVCacheBlocks] = {}
+        num_scheduled_tokens: dict[str, int] = {}
+        scheduled_timestamp = time.monotonic()
+        block_table_dict: dict[str, torch.Tensor] = {}
+        cached_block_table: list[int] = []
+        cached_length: list[int] = []
+        dummy_block: int | None = None
+        prefill_pad_target: tuple[int, int] | None = None
+        chunk = self.prefill_chunk_size
+        assert chunk is not None
+
+        # Drop a stale reference (finished / aborted / preempted request).
+        pf = self.prefilling
+        if pf is not None and (
+            pf.status != RequestStatus.RUNNING or pf not in self.running
+        ):
+            pf = self.prefilling = None
+            self.interleave.reset_prefill()
+
+        decodable = [r for r in self.running if r is not pf]
+        can_start = (
+            pf is None
+            and bool(self.waiting)
+            and len(self.running) < self.max_num_running_reqs
+        )
+        chunk_is_last = (
+            pf is not None and pf.num_tokens - pf.num_computed_tokens <= chunk
+        )
+        action = self.interleave.decide(
+            has_prefill_work=pf is not None or can_start,
+            num_decodable=len(decodable),
+            chunk_is_last=chunk_is_last,
+        )
+
+        if action == CHUNK and pf is not None:
+            # Next chunk of the request in progress. Its KV slots were all
+            # allocated (and its prefix blocks hashed) at the first chunk.
+            start = pf.num_computed_tokens
+            n = min(chunk, pf.num_tokens - start)
+            scheduled_running_reqs.append(pf)
+            req_to_new_blocks[pf.request_id] = (
+                self.kv_cache_manager.empty_kv_cache_blocks
+            )
+            num_scheduled_tokens[pf.request_id] = n
+            if self.cache_config.enable_prefix_caching:
+                self.update_block_table_dict(pf, block_table_dict)
+            if start + n >= pf.num_tokens:
+                self.prefilling = None  # joins the decode batch next step
+        elif action == CHUNK:
+            started = self._start_prefill(
+                scheduled_new_reqs,
+                scheduled_resumed_reqs,
+                req_to_new_blocks,
+                num_scheduled_tokens,
+                block_table_dict,
+                scheduled_timestamp,
+            )
+            if started is None:
+                action = DECODE if decodable else IDLE
+            else:
+                cached_block_table, cached_length = started
+
+        if action == DECODE:
+            prefill_req = self.prefilling
+            for request in list(decodable):
+                if request not in self.running:
+                    continue  # preempted below
+                num_new_tokens = min(
+                    1, self.max_model_len - 1 - request.num_computed_tokens
+                )
+                if num_new_tokens <= 0:
+                    continue
+                new_blocks = None
+                while True:
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request, num_new_tokens
+                    )
+                    if new_blocks is not None:
+                        break
+                    # Preempt the lowest-priority request (same rule as the
+                    # default path).
+                    if self.policy == SchedulingPolicy.PRIORITY:
+                        preempted_req = max(
+                            self.running, key=lambda r: (r.priority, r.arrival_time)
+                        )
+                        self.running.remove(preempted_req)
+                        if preempted_req in scheduled_running_reqs:
+                            scheduled_running_reqs.remove(preempted_req)
+                            req_to_new_blocks.pop(preempted_req.request_id)
+                            num_scheduled_tokens.pop(preempted_req.request_id)
+                    else:
+                        preempted_req = self.running.pop()
+                    if preempted_req is prefill_req:
+                        self.prefilling = prefill_req = None
+                        self.interleave.reset_prefill()
+                    self._preempt_request(preempted_req, scheduled_timestamp)
+                    preempted_reqs.append(preempted_req)
+                    if preempted_req == request:
+                        break
+                if new_blocks is None:
+                    break
+                if self.cache_config.enable_prefix_caching:
+                    self.update_block_table_dict(request, block_table_dict)
+                scheduled_running_reqs.append(request)
+                req_to_new_blocks[request.request_id] = new_blocks
+                num_scheduled_tokens[request.request_id] = num_new_tokens
+
+            num_decode_reqs = len(scheduled_running_reqs)
+            if 0 < num_decode_reqs < self.max_num_running_reqs:
+                if prefill_req is not None:
+                    prefill_pad_target = self._prefill_pad_target(prefill_req)
+                if self.cache_config.enable_prefix_caching:
+                    # With a prefill in progress every outer block may be owned
+                    # (e.g. 7 decoding + 1 prefilling); then pad into the
+                    # prefill block instead of failing in get_dummy_block().
+                    pcm = self.kv_cache_manager.prefix_cache_manager
+                    if (
+                        prefill_req is None
+                        or not pcm.is_full_block_available()
+                        or pcm.can_allocate(1, 0)
+                    ):
+                        dummy_block = self.kv_cache_manager.get_dummy_block()
+            if not scheduled_running_reqs:
+                action = IDLE
+
+        total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+        assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        assert len(self.running) <= self.max_num_running_reqs
+
+        num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
+        if self.running:
+            num_common_prefix_blocks = (
+                self.kv_cache_manager.get_num_common_prefix_blocks(
+                    self.running[0].request_id
+                )
+            )
+        new_reqs_data = [
+            NewRequestData.from_request(
+                req, req_to_new_blocks[req.request_id].get_block_ids()
+            )
+            for req in scheduled_new_reqs
+        ]
+        cached_reqs_data = self._make_cached_request_data(
+            scheduled_running_reqs,
+            scheduled_resumed_reqs,
+            num_scheduled_tokens,
+            {},
+            req_to_new_blocks,
+        )
+        self.prev_step_scheduled_req_ids.clear()
+        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
+
+        scheduler_output = RBLNSchedulerOutput(
+            scheduled_new_reqs=new_reqs_data,
+            scheduled_cached_reqs=cached_reqs_data,
+            num_scheduled_tokens=num_scheduled_tokens,
+            total_num_scheduled_tokens=total_num_scheduled_tokens,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs=None,
+            num_common_prefix_blocks=num_common_prefix_blocks,
+            preempted_req_ids={req.request_id for req in preempted_reqs},
+            finished_req_ids=self.finished_req_ids,
+            free_encoder_mm_hashes=[],
+            block_table_dict=block_table_dict,
+            cached_block_table=cached_block_table,
+            cached_length=cached_length,
+            dummy_block=dummy_block,
+            prefill_pad_target=prefill_pad_target,
+        )
+        self._update_after_schedule(scheduler_output)
+        self.interleave.on_scheduled(
+            action, num_decode=len(scheduled_running_reqs) if action == DECODE else 0
+        )
+        return scheduler_output
+
+    def _start_prefill(
+        self,
+        scheduled_new_reqs: list[Request],
+        scheduled_resumed_reqs: list[Request],
+        req_to_new_blocks: dict[str, KVCacheBlocks],
+        num_scheduled_tokens: dict[str, int],
+        block_table_dict: dict[str, torch.Tensor],
+        scheduled_timestamp: float,
+    ) -> tuple[list[int], list[int]] | None:
+        """Admit the head of the waiting queue and schedule its first chunk.
+        Mirrors the WAITING loop of `schedule()`; the only difference is the
+        number of scheduled tokens. Returns (cached_block_table, cached_length)
+        or None if nothing could be admitted."""
+        chunk = self.prefill_chunk_size
+        skipped_waiting_requests = create_request_queue(self.policy)
+        result = None
+        while self.waiting and len(self.running) < self.max_num_running_reqs:
+            request = self.waiting.peek_request()
+            if request.status == RequestStatus.WAITING_FOR_FSM:
+                structured_output_req = request.structured_output_request
+                if structured_output_req and structured_output_req.grammar:
+                    request.status = RequestStatus.WAITING
+                else:
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
+            assert request.num_computed_tokens == 0
+            num_tokens = request.num_tokens
+            assert num_tokens > 0
+            # Same allocation as the default path: slots for the whole prompt.
+            new_blocks = self.kv_cache_manager.allocate_slots(request, num_tokens)
+            if new_blocks is None:
+                break
+            new_computed_blocks, num_new_local_computed_tokens = (
+                self.kv_cache_manager.get_computed_blocks(request)
+            )
+            cached_block_table: list[int] = []
+            cached_length: list[int] = []
+            if self.cache_config.enable_prefix_caching:
+                (
+                    cached_block_table,
+                    cached_length,
+                ) = self.kv_cache_manager.get_prefix_cached_blocks(
+                    request,
+                    new_computed_blocks,
+                    num_new_local_computed_tokens,
+                )
+                self.update_block_table_dict(request, block_table_dict)
+            request = self.waiting.pop_request()
+            self.running.append(request)
+            if self.log_stats:
+                request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
+            whole = self._prefill_whole(request)
+            if request.status == RequestStatus.WAITING:
+                scheduled_new_reqs.append(request)
+            elif request.status == RequestStatus.PREEMPTED:
+                scheduled_resumed_reqs.append(request)
+            else:
+                raise RuntimeError(f"Invalid request status: {request.status}")
+            req_to_new_blocks[request.request_id] = self.kv_cache_manager.get_blocks(
+                request.request_id
+            )
+            request.status = RequestStatus.RUNNING
+            request.num_computed_tokens = 0
+            if whole:
+                n = num_tokens
+            else:
+                # The first chunk starts right after the prefix-cache hit.
+                n = min(num_tokens, sum(cached_length) + chunk)
+                if n < num_tokens:
+                    self.prefilling = request
+            num_scheduled_tokens[request.request_id] = n
+            result = (cached_block_table, cached_length)
+            break
+        if skipped_waiting_requests:
+            self.waiting.prepend_requests(skipped_waiting_requests)
+        return result
+
+    def update_from_output(self, scheduler_output, model_runner_output):
+        if self.interleave.enabled:
+            self.interleave.on_output()
+        return super().update_from_output(scheduler_output, model_runner_output)
 
     def update_block_table_dict(
         self, request: Request, block_table_dict: dict[str, torch.Tensor]

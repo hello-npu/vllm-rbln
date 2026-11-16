@@ -52,7 +52,12 @@ class RBLNOptimumForCausalLM(
         is_prompt = model_input.is_prompt
 
         kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, cache_position, dummy_block=dummy_block
+            is_prompt,
+            block_tables,
+            input_ids,
+            cache_position,
+            dummy_block=dummy_block,
+            prefill_pad_target=model_input.prefill_pad_target,
         )
         padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
 

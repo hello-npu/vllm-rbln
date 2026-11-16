@@ -246,6 +246,9 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         # Ephemeral state transferred
         # between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
+        # Set when this step runs a prefill chunk that does not finish the
+        # prompt (VLLM_RBLN_INTERLEAVE_POLICY); its logits are not sampled.
+        self.partial_prefill_req_id: str | None = None
 
         # FIXME async_scheduling?
 
@@ -402,6 +405,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         num_decode_reqs = scheduler_output.scheduled_cached_reqs.num_reqs
         finished_requests_ids = scheduler_output.finished_req_ids
         is_prefill = False
+        self.partial_prefill_req_id = None
 
         if num_prefill_reqs > 1 or (num_prefill_reqs >= 1 and num_decode_reqs > 0):
             raise RuntimeError(
@@ -410,7 +414,12 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
 
         if num_prefill_reqs > 0 or (
             num_decode_reqs == 1
-            and scheduler_output.scheduled_cached_reqs.resumed_from_preemption[0]
+            and (
+                scheduler_output.scheduled_cached_reqs.resumed_from_preemption[0]
+                or self._is_mid_prefill(
+                    scheduler_output.scheduled_cached_reqs.req_ids[0]
+                )
+            )
         ):
             is_prefill = True
 
@@ -452,8 +461,21 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             cached_lengths=cached_lengths,
             is_prompt=is_prefill,
             dummy_block=scheduler_output.dummy_block,
+            prefill_pad_target=(
+                None
+                if is_prefill
+                else getattr(scheduler_output, "prefill_pad_target", None)
+            ),
         )
         return model_input, num_scheduled_tokens
+
+    def _is_mid_prefill(self, req_id: str) -> bool:
+        """A running request whose prompt is not fully prefilled yet. Only
+        happens with prefill/decode interleaving (chunk-by-chunk prefill)."""
+        req_state = self.requests.get(req_id)
+        if req_state is None or req_state.prompt_token_ids is None:
+            return False
+        return req_state.num_computed_tokens < len(req_state.prompt_token_ids)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
@@ -535,6 +557,15 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
             req_index = self.input_batch.req_id_to_index[req_id]
             prompt_tokens = np.array(scheduled.prompt_token_ids)
             block_ids = scheduled.block_ids[0]
+        elif scheduler_output.scheduled_cached_reqs.num_reqs == 1 and (
+            self._is_mid_prefill(scheduler_output.scheduled_cached_reqs.req_ids[0])
+            and not scheduler_output.scheduled_cached_reqs.resumed_from_preemption[0]
+        ):
+            # Next chunk of a chunk-by-chunk prefill (interleaving)
+            req_id = scheduler_output.scheduled_cached_reqs.req_ids[0]
+            req_index = self.input_batch.req_id_to_index[req_id]
+            prompt_tokens = np.array(self.requests[req_id].prompt_token_ids)
+            block_ids = self.requests[req_id].block_ids[0]
         elif scheduler_output.scheduled_cached_reqs.num_reqs == 1:
             # Preempted request resumed
             req_id = scheduler_output.scheduled_cached_reqs.req_ids[0]
@@ -581,6 +612,19 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
                 len(self.requests[req_id].output_token_ids),
                 block_table.tolist(),
             )
+
+        # Only [begin, end) of the prompt is computed in this step. Without
+        # interleaving this is the whole (uncached part of the) prompt.
+        begin = int(self.requests[req_id].num_computed_tokens)
+        end = begin + int(scheduler_output.num_scheduled_tokens[req_id])
+        first = int(input_positions[0])
+        lo, hi = max(begin, first) - first, end - first
+        if lo != 0 or hi != len(prompt_tokens):
+            prompt_tokens = prompt_tokens[lo:hi]
+            input_positions = input_positions[lo:hi]
+            assert len(prompt_tokens) > 0
+        if end < seq_len:
+            self.partial_prefill_req_id = req_id
 
         running_request_ids.append(req_id)
 
@@ -1283,6 +1327,21 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin):
         use_padding = self.use_rbln_sampler and self.input_batch.num_reqs > 1
         # Clear ephemeral state.
         self.execute_model_state = None
+
+        if is_prompt and self.partial_prefill_req_id is not None:
+            # Intermediate prefill chunk: nothing to sample (same contract as
+            # vLLM chunked prefill: no output token until the prompt is done).
+            self.partial_prefill_req_id = None
+            self.input_batch.prev_sampled_token_ids = None
+            return ModelRunnerOutput(
+                req_ids=self.input_batch.req_ids.copy(),
+                req_id_to_index=self.input_batch.req_id_to_index.copy(),
+                sampled_token_ids=[[] for _ in self.input_batch.req_ids],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+                num_nans_in_logits={},
+            )
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:

@@ -57,6 +57,7 @@ def create_scheduler(
     async_scheduling: bool = False,
     outer_block_size: int = 0,
     enable_prefix_caching: bool = False,
+    additional_config: dict | None = None,
 ) -> RBLNOptimumScheduler:
     """Create RBLNOptimumscheduler under test.
 
@@ -102,6 +103,7 @@ def create_scheduler(
         structured_outputs_config=structured_outputs_config,
         additional_config={
             "attn_block_size": outer_block_size,
+            **(additional_config or {}),
         },
     )
     kv_cache_config = KVCacheConfig(
